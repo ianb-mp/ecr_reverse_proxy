@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httputil"
+	"net/url"
 	"os"
 
 	ecr "github.com/awslabs/amazon-ecr-credential-helper/ecr-login"
@@ -15,15 +16,18 @@ import (
 
 func main() {
 
-	var ECRRegistry string
-
 	apiPort := flag.Int("port", 8080, "listen on this port")
 	debug := flag.Bool("debug", false, "enable debug logging")
-	flag.StringVar(&ECRRegistry, "ecr_registry", "", "ECR registry")
+	ecrRegistry := flag.String("ecr_registry", "", "ECR registry")
+	proxyHostname := flag.String("proxy_hostname", "", "proxy hostname")
 	flag.Parse()
 
-	if ECRRegistry == "" {
+	if *ecrRegistry == "" {
 		fmt.Println("ecr_registry must be set")
+		os.Exit(1)
+	}
+	if *proxyHostname == "" {
+		fmt.Println("proxy_hostname must be set")
 		os.Exit(1)
 	}
 
@@ -37,7 +41,7 @@ func main() {
 	ecrCredHelper := ecr.NewECRHelper()
 
 	// Attempt to fetch credentials initially
-	_, _, err := ecrCredHelper.Get(ECRRegistry)
+	_, _, err := ecrCredHelper.Get(*ecrRegistry)
 	if err != nil {
 		log.Fatalf("error getting credentials %q", err)
 	}
@@ -47,7 +51,7 @@ func main() {
 
 		proxy := httputil.ReverseProxy{
 			Rewrite: func(r *httputil.ProxyRequest) {
-				username, password, err := ecrCredHelper.Get(ECRRegistry)
+				username, password, err := ecrCredHelper.Get(*ecrRegistry)
 				if err != nil {
 					slog.Error("error getting credentials", "err", err)
 					return
@@ -55,8 +59,8 @@ func main() {
 				r.Out.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(username+":"+password)))
 
 				r.Out.URL.Scheme = "https"
-				r.Out.URL.Host = ECRRegistry
-				r.Out.Host = ECRRegistry
+				r.Out.URL.Host = *ecrRegistry
+				r.Out.Host = *ecrRegistry
 
 				slog.InfoContext(r.In.Context(), "ECR Request", "Method", r.In.Method, "Path", r.In.URL.Path)
 			},
@@ -66,6 +70,21 @@ func main() {
 			},
 			ModifyResponse: func(resp *http.Response) error {
 				slog.DebugContext(resp.Request.Context(), "ECR Response", "status", resp.Status, "header", resp.Header)
+
+				// if ECR returns a Location header, then swap out the ECR hostname for the proxy hostname:port
+				if resp.Header.Get("Location") != "" {
+					redir, err := url.Parse(resp.Header.Get("Location"))
+					if err != nil {
+						return err
+					}
+
+					newRedir := *redir
+					newRedir.Scheme = "http"
+					newRedir.Host = fmt.Sprintf("%s:%d", *proxyHostname, *apiPort)
+
+					slog.Debug("rewrite ECR redirect", "from", redir.String(), "to", newRedir.String())
+					resp.Header.Set("Location", newRedir.String())
+				}
 				return nil
 			},
 		}
